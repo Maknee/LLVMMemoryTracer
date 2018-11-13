@@ -20,6 +20,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <random>
+#include <sstream>
 #include <set>
 
 #include "command-line-options.h"
@@ -27,6 +28,10 @@
 #include "llvm/IR/LegacyPassManager.h"
 
 using namespace llvm;
+
+#define EXIT_WITH_MESSAGE(...) \
+  llvm::errs() << __VA_ARGS__; \
+  exit(-1); \
 
 LLVMContext llvm_context;
 
@@ -142,40 +147,61 @@ struct BasicPass : public FunctionPass {
     DITypeNode top_level_di_type_node{};
     std::string struct_name{};
 
+    // template<typename Callback>
+    // void iterate_tree(Callback callback)
+    // {
+    //   bool found_struct = false;
+    //   iterate_tree_impl(top_level_di_type_node, callback, found_struct);
+    // }
+
     template<typename Callback>
     void iterate_tree(Callback callback)
     {
-      bool found_struct = false;
-      iterate_tree_impl(top_level_di_type_node, callback, found_struct);
+      iterate_tree_impl(top_level_di_type_node, callback);
     }
 
     // template<typename Callback>
-    // void iterate_tree_impl(DITypeNode& node, Callback callback, int level = 0)
+    // void iterate_tree_impl(DITypeNode& node, Callback callback, bool& top_struct_found)
     // {
-    //   callback(node.type_of_di_type, node.di_type, level);
+    //   //TODO change this to check something else to end
+    //   //cur
+    //   if(node.type_of_di_type == DITypeNodeType::Composite)
+    //   {
+    //     callback(node.type_of_di_type, node.di_type);
+    //     top_struct_found = true;
+    //     return;
+    //   }
     //   for(auto& child : node.children)
     //   {
-    //     iterate_tree_impl(child, callback, level + 1);
+    //     iterate_tree_impl(child, callback, top_struct_found);
+    //     if(top_struct_found)
+    //     {
+    //       break;
+    //     }
     //   }
     // }
 
     template<typename Callback>
-    void iterate_tree_impl(DITypeNode& node, Callback callback, bool& top_struct_found)
+    bool iterate_tree_impl(DITypeNode& node, Callback callback)
     {
+      //TODO change this to check something else to end
+      //if current element is a struct
       if(node.type_of_di_type == DITypeNodeType::Composite)
       {
-        callback(node.type_of_di_type, node.di_type);
-        top_struct_found = true;
-        return;
+        //iterate through children
+        return callback(node.type_of_di_type, node.di_type);
       }
+
+      //iterate through children
       for(auto& child : node.children)
       {
-        iterate_tree_impl(child, callback, top_struct_found);
-        if(top_struct_found)
+        //iterate through them to see if possibly struct
+        if(!iterate_tree_impl(child, callback))
         {
-          break;
+          return false;
         }
       }
+      return true;
     }
   };
 
@@ -390,6 +416,11 @@ struct BasicPass : public FunctionPass {
     const auto& basic_block = instruction.getParent();
     outs() << "instruction DUMP\n";
     instruction.dump();
+
+    //if(instruction.getOpcode() != Instruction::MemoryOps::Store)
+    //{
+    //  return;
+    //}
     for (std::size_t i = 0; i < instruction.getNumOperands(); ++i) {
       const auto &operand = instruction.getOperand(i);
 
@@ -432,7 +463,8 @@ struct BasicPass : public FunctionPass {
           DITypeTree tree = found_itr->second;
           outs() << "NAME: " << struct_name << "\n";
 
-          IRBuilder<> ir_builder(&instruction);
+          //print out after we edit to get next node :)
+          IRBuilder<> ir_builder(instruction.getNextNode());
 
           //check if printf is avaliable
           const auto &mod = basic_block->getModule();
@@ -450,24 +482,34 @@ struct BasicPass : public FunctionPass {
             printf_function->setAttributes(AttributeList{});
           }
 
-          tree.iterate_tree([&](DITypeNodeType& node_type, DIType* type, int level)
+          //set of structs already iterated through
+          std::set<std::string> self_referencing{struct_name};
+
+          //print struct type and variable name
+          Value *struct_type_string = ir_builder.CreateGlobalStringPtr(struct_name);
+          Value *struct_name_string = ir_builder.CreateGlobalStringPtr(operand->getName());
+          std::vector<Value*> struct_arguments{ir_builder.CreateGlobalStringPtr("%s %s\n"), struct_type_string, struct_name_string};
+
+          ir_builder.CreateCall(printf_function, struct_arguments, "call");
+
+          tree.iterate_tree([&](DITypeNodeType& node_type, DIType* di_type)
           {
             switch(node_type)
             {
             case DITypeNodeType::Unknown:
             {
-              ExitOnError("Reached an impossible node");
+              EXIT_WITH_MESSAGE("Reached an impossible node");
               break;
             }
             case DITypeNodeType::Basic: 
             {
-              DIBasicType* basic_type = cast<DIBasicType>(type);
+              DIBasicType* basic_type = cast<DIBasicType>(di_type);
               //ignore for now
               break;
             }
             case DITypeNodeType::Composite:
             {
-              DICompositeType* composite_type = cast<DICompositeType>(type);
+              DICompositeType* composite_type = cast<DICompositeType>(di_type);
 
               if(composite_type->getTag() == dwarf::DW_TAG_structure_type)
               {
@@ -483,7 +525,7 @@ struct BasicPass : public FunctionPass {
 
                 //create format string
                 std::string format_string;
-                for(int i = 0; i < num_member_elements; i++)
+                for(auto i = 0; i < num_member_elements; i++)
                 {
                   format_string += "%s,%d,";
                 }
@@ -504,6 +546,17 @@ struct BasicPass : public FunctionPass {
                     //check if is member
                     if(di_derived->getTag() == dwarf::DW_TAG_member)
                     {
+                      //check if is self referencing
+                      llvm::outs() << "AAA" << di_derived->getBaseType().resolve()->getName() << " " << struct_name
+                        << "\n";
+
+                      if(struct_name == di_derived->getBaseType().resolve()->getName())
+                      {
+                        //TODO create loop until null, if pointer
+                        //for now, print same thing
+                        llvm::outs() << "SELF REFERENCING\n";
+                      }
+
                       arguments.emplace_back(ir_builder.CreateGlobalStringPtr(di_derived->getName()));
 
                       //get correct offset to struct member
@@ -520,7 +573,7 @@ struct BasicPass : public FunctionPass {
                     }
                     else
                     {
-                      ExitOnError("Reached an impossible node");
+                      EXIT_WITH_MESSAGE("Reached an impossible node");
                     }
                   }
                 }
@@ -531,7 +584,7 @@ struct BasicPass : public FunctionPass {
             }
             case DITypeNodeType::Derived: 
             {
-              DIDerivedType* derived_type = cast<DIDerivedType>(type);
+              DIDerivedType* derived_type = cast<DIDerivedType>(di_type);
 
               //struct member
               if(derived_type->getTag() == dwarf::DW_TAG_member)
@@ -542,17 +595,431 @@ struct BasicPass : public FunctionPass {
             }
             case DITypeNodeType::Subroutine:
             {
-              DISubroutineType* subroutine_type = cast<DISubroutineType>(type);
+              DISubroutineType* subroutine_type = cast<DISubroutineType>(di_type);
               break;
             }
             default: 
             { 
-                ExitOnError("Reached an impossible node");
+                EXIT_WITH_MESSAGE("Reached an impossible node");
             }
             }
+            return true;
           });
         }
       }
+    }
+  }
+
+  void print_trace3(Instruction& instruction)
+  {
+    //recursive iteration to find first load to struct
+    std::vector<Instruction*> struct_element_chain;
+
+    //next expected instruction to place builder
+    Instruction* instruction_to_build_on = instruction.getNextNode();
+
+    //iterate until hit instruction that is not load/GEP, which should be alloca
+    std::function<void(Instruction*)> recurse_until_base;
+    recurse_until_base = [&recurse_until_base, &struct_element_chain, &instruction_to_build_on](Instruction* this_instruction)
+    {
+      //catch load instruction
+      if(LoadInst* load_inst = dyn_cast<LoadInst>(this_instruction))
+      {
+        if(Instruction* pointer_operand = dyn_cast<Instruction>(load_inst->getPointerOperand()))
+        {
+          //add this instruction to chain
+          struct_element_chain.emplace_back(pointer_operand);
+          recurse_until_base(pointer_operand);          
+        }
+      }
+      //catch GEP instructions
+      else if(GetElementPtrInst* GEPInst = dyn_cast<GetElementPtrInst>(this_instruction))
+      {
+        if(Instruction* pointer_operand = dyn_cast<Instruction>(GEPInst->getPointerOperand()))
+        {
+          //add this instruction to chain
+          struct_element_chain.emplace_back(pointer_operand);
+          recurse_until_base(pointer_operand);          
+        }
+      }
+      else if(AllocaInst* alloca_inst = dyn_cast<AllocaInst>(this_instruction))
+      {
+        //do nothing, this is top level
+      }
+      else if(CallInst* call_inst = dyn_cast<CallInst>(this_instruction))
+      {
+        //do nothing, this is top level
+        const StringRef called_function = call_inst->getCalledFunction()->getName();
+      
+        //check if malloc/free
+        if(called_function == "malloc")
+        {
+          //have to go forward and get store
+
+          //expect bitcast and then store
+          for(Value* user : this_instruction->users())
+          {
+            if(BitCastInst* bit_cast_inst = dyn_cast<BitCastInst>(user))
+            {
+              for(Value* bit_cast_user : bit_cast_inst->users())
+              {
+                if(StoreInst* store_inst = dyn_cast<StoreInst>(bit_cast_user))
+                {
+                  //remove all elements
+                  struct_element_chain.clear();
+
+                  //instruction should be good to use at this point
+                  instruction_to_build_on = store_inst->getNextNode();
+
+                  //add store instruction
+                  struct_element_chain.emplace_back(store_inst);
+
+                  //restore call entry after store instruction
+                  struct_element_chain.emplace_back(this_instruction);
+
+                  if(Instruction* pointer_operand = dyn_cast<Instruction>(store_inst->getPointerOperand()))
+                  {
+                    //add to chain
+                    struct_element_chain.emplace_back(pointer_operand);
+
+                    //recurse
+                    recurse_until_base(pointer_operand);
+                  }
+
+                  return;
+                }
+              }
+            }
+          }
+        }
+        else if(called_function == "free")
+        {
+          //first argument is operand
+          if(call_inst->getNumArgOperands() == 1)
+          {
+            //return value is operand
+            if(Instruction* pointer_operand = dyn_cast<Instruction>(call_inst->getArgOperand(0)))
+            {
+              recurse_until_base(pointer_operand);
+            }
+          } 
+          else
+          {
+            EXIT_WITH_MESSAGE("Free should have only one argument\n");
+          }
+        }
+      }
+      else if(BitCastInst* bit_cast_inst = dyn_cast<BitCastInst>(this_instruction))
+      {
+        //first argument is operand
+        if(bit_cast_inst->getNumOperands() == 1)
+        {
+          //return value is operand
+          if(Instruction* pointer_operand = dyn_cast<Instruction>(bit_cast_inst->getOperand(0)))
+          {
+            //add to chain
+            struct_element_chain.emplace_back(pointer_operand);
+            recurse_until_base(pointer_operand);
+          }
+        } 
+        else
+        {
+          EXIT_WITH_MESSAGE("Free should have only one argument\n");
+        }
+      }
+      else
+      {
+        //should never happen since iterating through all the deferences
+        for(Value* v : struct_element_chain)
+        {
+          v->dump();
+        }
+        this_instruction->dump();
+        EXIT_WITH_MESSAGE("While looping to find base struct, encountered bad instruction\n");
+      }
+      //iterate through use because they're the values that this value depends on, (use)
+      //not this value depending on this value (aka an add with this value as a parameter)
+    };
+
+    //block
+    const auto& basic_block = instruction.getParent();
+    //outs() << "instruction DUMP\n";
+    //instruction.dump();
+
+    //TODO malloc/free
+    Value* pointer_operand = nullptr;
+
+    if(StoreInst* store_inst = dyn_cast<StoreInst>(&instruction))
+    {
+      //place this instruction in the chain
+      struct_element_chain.emplace_back(&instruction);
+
+      pointer_operand = store_inst->getPointerOperand();
+    }
+    else if(CallInst* call_inst = dyn_cast<CallInst>(&instruction)) 
+    {
+      const StringRef called_function = call_inst->getCalledFunction()->getName();
+      
+      //check if malloc/free
+      if(called_function == "malloc" || called_function == "free")
+      {
+        //return value is operand
+        //set function to start as free
+        pointer_operand = call_inst;
+      }
+    }
+
+    //return if instruction isn't a store or call
+    if(pointer_operand == nullptr)
+    {
+      return;
+    }
+
+    //pointer operand itself is an instruction
+    if(Instruction* operand_instruction = dyn_cast<Instruction>(pointer_operand))
+    {
+      //place this operand instruction into the chain as well
+      struct_element_chain.emplace_back(operand_instruction);
+
+      //now recurse until base class
+      recurse_until_base(operand_instruction);
+    }
+    else
+    {
+      EXIT_WITH_MESSAGE("Store pointer operand is not an instruction -- Must be an instruction\n");
+    }
+
+    //reverse the instructions, cause iterated from last instruction to first (which should be alloca)
+    std::reverse(std::begin(struct_element_chain), std::end(struct_element_chain));
+
+    //ex
+    /*
+     %addr_s2 = alloca %struct.Stuff**, align 8
+     %3 = load %struct.Stuff**, %struct.Stuff*** %addr_s2, align 8, !dbg !40
+     %4 = load %struct.Stuff*, %struct.Stuff** %3, align 8, !dbg !41
+     %one3 = getelementptr inbounds %struct.Stuff, %struct.Stuff* %4, i32 0, i32 0, !dbg !42
+     store i32 1, i32* %one3, align 8, !dbg !43
+     */
+
+    //first instruction should be alloca... 
+    Instruction* struct_instruction = struct_element_chain[0];
+
+    //recurse on pointer until arrive at struct
+    Type *struct_instruction_type = struct_instruction->getType();
+    std::size_t num_pointer_deferences = 0;
+    while (PointerType *pointer_type = dyn_cast<PointerType>(struct_instruction_type)) {
+      struct_instruction_type = pointer_type->getElementType();
+      num_pointer_deferences++;
+    }
+
+    //if arrived type is a struct (which definitely should be since first is alloca)
+    if (StructType *struct_type = dyn_cast<StructType>(struct_instruction_type)) {
+
+      //have to parse the type name (format is struct.Foo << want to get Foo)
+      //assume less than 10 periods...
+      SmallVector<StringRef, 10> struct_names;
+      struct_type->getName().split(struct_names, ".");
+
+      //go up to first string that isn't empty
+      auto struct_name_itr = std::find_if(struct_names.rbegin(), struct_names.rend(),
+                                   [](const StringRef &str)
+                                   {
+                                     return !str.empty();
+                                   });
+
+      llvm::outs() << "YES:" << *struct_name_itr << "\n";;
+
+      //check if printf is avaliable
+      const auto &mod = basic_block->getModule();
+      Function *printf_function = mod->getFunction("printf");
+      if (!printf_function) {
+        FunctionType *FuncTy9 = FunctionType::
+          get(IntegerType::get(mod->getContext(), 32), true);
+
+        printf_function = Function::Create(FuncTy9,
+                                           GlobalValue::
+                                           ExternalLinkage,
+                                           "printf", mod);
+        printf_function->setCallingConv(CallingConv::C);
+
+        printf_function->setAttributes(AttributeList{});
+      }
+
+      //print out after we edit to get next node :)
+      IRBuilder<> ir_builder(instruction_to_build_on);
+
+      //prepare arguments
+      std::vector<Value*> arguments{};
+
+      std::string format_string = "\n%s";
+
+      //string for about what are arguments
+      std::stringstream data_string;
+
+      //create header
+      data_string << "HEADER:";
+
+      //print out debug info: filename, the function, line
+      MDNode* md_node = instruction.getMetadata("dbg");
+      if(md_node)
+      {
+        if(DILocation* debug_location = dyn_cast<DILocation>(md_node))
+        {
+          const std::string filename = debug_location->getFilename().str();
+          const std::string function_name = basic_block->getParent()->getName().str();
+          const unsigned line_no = debug_location->getLine();
+          data_string << filename << "-"
+                      << function_name << "-"
+                      << line_no << ":";
+        }
+        else
+        {
+          EXIT_WITH_MESSAGE("Expecting debug information to be compiled\n");
+        } 
+      } 
+      else 
+      {
+        const std::string function_name = basic_block->getParent()->getName().str();
+        data_string << "NULL" << "-"
+                    << function_name << "-"
+                    << "NULL" << ":";
+      } 
+      
+      //TODO hacky, pointer value is stored pointer value, instead of int
+      Value* stored_pointer_value = nullptr;
+
+      //iterate through all instructions and construct printf to send
+      for(Instruction* i : struct_element_chain)
+      {
+        i->dump();
+
+        if(AllocaInst* alloca_inst = dyn_cast<AllocaInst>(i)) 
+        {
+          //must be first instruction
+
+          //TODO stack address
+          //get the address first???
+
+          //print out struct type and name
+          data_string << struct_name_itr->str() << std::string(num_pointer_deferences, '*') << "-"
+                      << alloca_inst->getName().str() << ":";
+        }
+        else if(LoadInst* load_inst = dyn_cast<LoadInst>(i))
+        {
+          //print out * for deference
+          data_string << "*:";
+        }
+        else if(GetElementPtrInst* GEPInst = dyn_cast<GetElementPtrInst>(i))
+        {
+          std::vector<int> indices{};
+
+          //get operands
+          for(size_t i = 0; i < GEPInst->getNumIndices(); i++)
+          {
+            if(ConstantInt* index = dyn_cast<ConstantInt>(GEPInst->getOperand(i + 1)))
+            {
+              //first has to be 0
+              if(!i && index->getZExtValue())
+              {
+                EXIT_WITH_MESSAGE("First index of GEP is 0, should not happen");
+              }
+              indices.emplace_back(index->getZExtValue());
+            }
+          }
+
+          //print out values
+          //std::copy(std::begin(indices), std::end(indices), std::ostream_iterator<int>(llvm::outs, ":"));
+          for(auto& index : indices)
+          {
+            data_string << std::hex << index << ":";
+          }
+        }
+        else if(StoreInst* store_inst = dyn_cast<StoreInst>(i))
+        {
+          //this must be the last instruction!!!
+          if(ConstantInt* constant_int = dyn_cast<ConstantInt>(store_inst->getValueOperand()))
+          {
+            data_string << "s-" << constant_int->getZExtValue();
+          } 
+          else
+          {
+            //form pointer value
+            data_string << "s-";
+            format_string += "%p";
+            //std::vector<Value*> indices{ ConstantInt::get(basic_block->getContext(), APInt(32, 0))};
+
+            Value* store_operand = store_inst->getValueOperand();
+            stored_pointer_value = store_operand;//ir_builder.CreateGEP(store_operand->getType(), store_operand, indices);
+          }
+        }
+        else if(CallInst* call_inst = dyn_cast<CallInst>(i)) 
+        {
+          const StringRef called_function = call_inst->getCalledFunction()->getName();
+
+          //check if malloc/free
+          if(called_function == "malloc")
+          {
+            data_string << "m:";
+          }
+          else if(called_function == "free")
+          {
+            //first argument is operand
+            if(call_inst->getNumArgOperands() == 1)
+            {
+              //form pointer value like store
+              data_string << "f-";
+              format_string += "%p";
+
+              //argument of free
+              stored_pointer_value = call_inst->getArgOperand(0);
+            }
+            else
+            {
+              EXIT_WITH_MESSAGE("Free should have only one argument\n");
+            }
+          }
+        }
+        else
+        {
+          llvm::errs() << "=========\n";
+          for(Value* v : struct_element_chain)
+          {
+            v->dump();            
+          }
+          EXIT_WITH_MESSAGE("Unknown instruction in list -- must only be load, gep, store, malloc, free, bitcast\n");
+        }
+      }
+
+      //end format string
+      format_string += "\n";
+
+      //create format string value
+      Value* format_string_value = ir_builder.CreateGlobalStringPtr(format_string);
+
+      //create data string value
+      Value* data_string_value = ir_builder.CreateGlobalStringPtr(data_string.str());
+
+      //put as argument
+      arguments.emplace_back(format_string_value);
+      arguments.emplace_back(data_string_value);
+
+      if (stored_pointer_value) 
+      {
+        arguments.emplace_back(stored_pointer_value);
+      }
+
+      //form arguments
+      ir_builder.CreateCall(printf_function, arguments);
+
+      llvm::outs() << "END\n";
+    }
+    else
+    {
+      //TODO handle ints
+      return;
+      struct_instruction_type->dump();
+      struct_instruction->dump();
+      EXIT_WITH_MESSAGE("First instruction should be alloca\n");
     }
   }
 
@@ -561,7 +1028,7 @@ struct BasicPass : public FunctionPass {
    */
 
   bool runOnFunction(Function &function) override {
-    llvm::outs() << function.getName() << "\n";
+    llvm::outs() << "FUNCTION: " << function.getName() << "\n";
 
     for (auto &basic_block : function) {
       std::vector<Value *> integers;
@@ -592,7 +1059,7 @@ struct BasicPass : public FunctionPass {
       //second run (actually print out data)
       for (auto &instruction : basic_block) {
         //print_trace(instruction);
-        print_trace2(instruction);
+        print_trace3(instruction);
       }
     }
     
