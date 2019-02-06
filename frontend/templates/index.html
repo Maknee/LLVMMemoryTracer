@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Flask SocketIO Test</title>
+  <script type="text/javascript" src="//code.jquery.com/jquery-1.4.2.min.js"></script>
+  <script type="text/javascript" src="//cdnjs.cloudflare.com/ajax/libs/socket.io/1.3.6/socket.io.min.js"></script>
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css" rel="stylesheet" type="text/css"/>
+
+  <style type="text/css">
+    #mynetwork {
+        width: 1440px;
+        height: 800px;
+        border: 1px solid lightgray;
+    }
+  </style>
+
+</head>
+
+<div id="mynetwork"></div>
+<h4 id="popup-event"></h4>
+
+<body>
+  <p>Some sample code to make sure Flask-SocketIO works...</p>
+  <button onclick="StartReading()">Start Reading</button>
+  <button onclick="StopReading()">Stop Reading</button>
+
+  <script type="text/javascript" charset="utf-8">
+    var id_map = {};
+    var nodes = new vis.DataSet();
+    var edges = new vis.DataSet();
+    var id = 1;
+
+    // create a network
+    var container = document.getElementById('mynetwork');
+
+    // provide the data in the vis format
+    var data = {
+        nodes: nodes,
+        edges: edges
+    };
+    var options = {};
+
+    // initialize your network!
+    var network = new vis.Network(container, data, options);
+
+    network.on("showPopup", function(node) { 
+      document.getElementById('popup-event').innerHTML = 'Popover shown! Node ID:' + node;
+      document.getElementById('popup-event').style = 'color: red';
+    });
+
+    var socket = io.connect('http://' + document.domain + ':' + location.port);
+    
+    function UpdateNodeInformatioGUI(node_info)
+    {
+      var title_string = 
+      node_info.address + "\n" +
+      node_info.filename + " " + node_info.in_function + " " + node_info.line_number + "\n" +
+      node_info.struct_type + " " + node_info.struct_name + "\n" +
+      node_info.type + "\n";
+      if(node_info.type == "operation")
+      {
+        node_info.node = { id: node_info.id, label: node_info.extra, title: "operation" };
+      }
+      else if(node_info.type == "heap")
+      {
+        node_info.node = { id: node_info.id, label: "Heap: " + node_info.struct_type + " " + node_info.address, title: title_string };
+      }
+      else if(node_info.type == "stack")
+      {
+        node_info.node = { id: node_info.id, label: "Stack: " + node_info.struct_type + " " + node_info.struct_name, title: title_string };
+      }
+    }
+
+    function UpdateNode(address, struct_type = "", struct_name = "", filename = "", in_function = "", line_number = "", type = "stack", extra = "")
+    {
+      if(!(address in id_map))
+      {
+        //create new node
+        var new_node_info = { id: id++, address: address, struct_type: struct_type, struct_name: struct_name, filename: filename, in_function: in_function, line_number: line_number, type: type, extra: extra, node: {}, edges: {} };
+        UpdateNodeInformatioGUI(new_node_info);
+
+        //store into map
+        id_map[address] = new_node_info;
+
+        nodes.add(new_node_info.node);
+      }
+      else
+      {
+        //in the map, just update
+        var node_info = id_map[address];
+        if(struct_type != "")
+        {
+          node_info.struct_type = struct_type;
+        }
+        if(struct_name != "")
+        {
+          node_info.struct_name = struct_name;
+        }
+        if(filename != "")
+        {
+          node_info.filename = filename;
+        }
+        if(in_function != "")
+        {
+          node_info.in_function = in_function;
+        }
+        if(line_number != "")
+        {
+          node_info.line_number = line_number;
+        }
+        if(node_info.type != type)
+        {
+          node_info.type = type;
+        }
+        node_info.extra = extra;
+
+        UpdateNodeInformatioGUI(node_info);
+
+        nodes.update(node_info.node);
+      }
+    }
+
+    function AddEdge(from_address, to_address)
+    {
+      if(from_address != to_address)
+      {
+        //take previous address and create edge
+        var from_node_info = id_map[from_address];
+        var to_node_info = id_map[to_address];
+
+        //check if exists
+        if(!(to_node_info.id in from_node_info.edges))
+        {
+          var edge = { from: from_node_info.id, to: to_node_info.id };
+          from_node_info.edges[to_node_info.id] = edge;
+
+          edges.add(edge)
+        }
+        //if not, then update the edge
+        //TODO
+      }
+    }
+
+    function AddOperation(from_address, to_address, operation_string, operation_value)
+    {
+      //check if operation string is a store, and if so, check if the address already exists
+      // if(operation_string == "Store value: ")
+      // {
+      //   //if already exists, do nothing
+      //   if(operation_value in id_map)
+      //   {
+      //     return;
+      //   }
+      // }
+      UpdateNode(to_address, "", "", "", "", "", "operation", operation_string + operation_value);
+      AddEdge(from_address, to_address);
+    }
+
+    // verify our websocket connection is established
+    socket.on('connect', function() {
+        console.log('Websocket connected!');
+    });
+
+    // message handler for the 'join_room' channel
+    socket.on('join_room', function(msg) {
+        console.log(msg);
+        var data = msg.data;
+        if(data.indexOf("HEADER:", 0) != -1)
+        {
+          var elements = data.split(":");
+          //HEADER:[[[wow.c-main-33]]]:Stuff**-s2:s-0x208a020
+
+          var file_informations = elements[1].split("-");
+          var filename = file_informations[0];
+          var in_function = file_informations[1];
+          var line_number = file_informations[2];
+
+          //HEADER:wow.c-main-33:[[[Stuff**-s2]]]:s-0x208a020
+          var struct_informations = elements[2].split("-");
+          var struct_type = struct_informations[0];
+          var struct_name = struct_informations[1];
+          var struct_stack_address = struct_informations[2];
+
+          //HEADER:wow.c-main-33:Stuff**-s2:[[[s-0x208a020]]]
+          //HEADER:wow.c-main-35:Stuff***-addr_s2:[[[*:*:0:0:s-1]]]
+          UpdateNode(struct_stack_address, struct_type, struct_name, filename, in_function, line_number);
+
+          //HEADER:wow.c-main-36:Stuff**-s2-0x7fffc8d46dc0:[[[*-0x7fffc8d46dc0-f-0xa01220]]]
+          //rest are operations
+          var struct_operations = elements[3].split("-");
+
+          //used for back tracking deferences
+          var prev_address = struct_stack_address;
+
+          //backtracking GEP operations for store
+          var gep_operations = "";
+
+          for(var i = 0; i < struct_operations.length; i++)
+          {
+            var element = struct_operations[i];
+            console.log("operation: " + element);
+            //deference
+            if(element == "*")
+            {
+              var address = struct_operations[++i];
+              if(address in id_map)
+              {
+                AddEdge(address, prev_address);
+              }
+              else
+              {
+                UpdateNode(address);
+              }
+              prev_address = address;
+            }
+            else if(element == "s")
+            {
+              var store_value = struct_operations[++i];
+              
+              //storing a pointer on stack, s is first
+              if(i == 1)
+              {
+                UpdateNode(store_value, struct_type);
+                AddEdge(store_value, prev_address);
+              }
+              else
+              {
+                AddOperation(prev_address, data, "Store value: " + gep_operations + " ", store_value);
+              }
+              //should be no more operations after
+            }
+            //malloc
+            else if(element == "m")
+            {
+              i = i + 2;
+              var address = struct_operations[i];
+
+              UpdateNode(address, struct_type, "", "", "", "", "heap");
+              console.log(id_map[address] + " " + id_map[prev_address]);
+              AddEdge(address, prev_address);
+              
+              //should be no more operations after
+            }
+            else if(element == "f")
+            {
+              var free_address = struct_operations[++i];
+            }
+            else if(element == "GEP")
+            {
+              //iterate until not a number
+              while(++i)
+              {
+                element = struct_operations[i];
+                
+                //check if is number
+                if(/^\d+$/.test(element) == false)
+                {
+                  i--;
+                  break;
+                }
+
+                //add to gep operations
+                gep_operations += "[" + element + "]";
+              }
+            }
+          }
+        }
+    });
+
+    function StartReading() {
+      socket.emit('start_reading', {reading: true});
+    }
+
+    function StopReading() {
+      socket.emit('start_reading', {reading: false});
+    }
+
+  </script>
+</body>
+</html>

@@ -768,6 +768,10 @@ struct BasicPass : public FunctionPass {
         pointer_operand = call_inst;
       }
     }
+    else if(IntrinsicInst* instrinstic_inst = dyn_cast<IntrinsicInst>(&instruction))
+    {
+      //todo memcpy..., etc
+    }
 
     //return if instruction isn't a store or call
     if(pointer_operand == nullptr)
@@ -851,13 +855,11 @@ struct BasicPass : public FunctionPass {
       //prepare arguments
       std::vector<Value*> arguments{};
 
-      std::string format_string = "\n%s";
-
-      //string for about what are arguments
-      std::stringstream data_string;
+      std::stringstream format_string;
+      format_string << "\n";
 
       //create header
-      data_string << "HEADER:";
+      format_string << "HEADER:";
 
       //print out debug info: filename, the function, line
       MDNode* md_node = instruction.getMetadata("dbg");
@@ -868,7 +870,7 @@ struct BasicPass : public FunctionPass {
           const std::string filename = debug_location->getFilename().str();
           const std::string function_name = basic_block->getParent()->getName().str();
           const unsigned line_no = debug_location->getLine();
-          data_string << filename << "-"
+          format_string << filename << "-"
                       << function_name << "-"
                       << line_no << ":";
         }
@@ -880,13 +882,38 @@ struct BasicPass : public FunctionPass {
       else 
       {
         const std::string function_name = basic_block->getParent()->getName().str();
-        data_string << "NULL" << "-"
+        format_string << "NULL" << "-"
                     << function_name << "-"
                     << "NULL" << ":";
       } 
-      
+
+      DICompositeType* composite_type = nullptr;
+
+      //get information about struct
+      if (const DbgDeclareInst *DDI = dyn_cast<DbgDeclareInst>(&instruction))
+      {
+        //local variable
+        DILocalVariable *di_local_variable = DDI->getVariable();
+        DIType *di_type = di_local_variable->getType().resolve();
+
+        //recurse until we reach a composite type
+        while(DIDerivedType* derived_type = dyn_cast<DIDerivedType>(di_type))
+        {
+          llvm::outs() << "GOT TYPE\n";
+          di_type = derived_type->getBaseType().resolve();
+        }
+
+        //must be composite type
+        if(composite_type = dyn_cast<DICompositeType>(di_type))
+        {
+          llvm::outs() << "GOT COMPOSITE\n";
+
+        }
+      }
+
       //TODO hacky, pointer value is stored pointer value, instead of int
       Value* stored_pointer_value = nullptr;
+      std::vector<Value*> load_variables;
 
       //iterate through all instructions and construct printf to send
       for(Instruction* i : struct_element_chain)
@@ -901,13 +928,23 @@ struct BasicPass : public FunctionPass {
           //get the address first???
 
           //print out struct type and name
-          data_string << struct_name_itr->str() << std::string(num_pointer_deferences, '*') << "-"
-                      << alloca_inst->getName().str() << ":";
+          format_string << struct_name_itr->str() << std::string(num_pointer_deferences, '*') << "-"
+                      << alloca_inst->getName().str() << "-";
+
+          format_string << "%p:";
+          load_variables.emplace_back(alloca_inst);
         }
         else if(LoadInst* load_inst = dyn_cast<LoadInst>(i))
         {
           //print out * for deference
-          data_string << "*:";
+          format_string << "*-";
+
+          format_string << "%p-";
+          
+          std::vector<Value*> indices{ ConstantInt::get(basic_block->getContext(), APInt(32, 0)), ConstantInt::get(basic_block->getContext(), APInt(32, 0))};
+          auto* struct_value = ir_builder.CreateGEP(struct_type, load_inst, indices);
+
+          load_variables.emplace_back(struct_value);
         }
         else if(GetElementPtrInst* GEPInst = dyn_cast<GetElementPtrInst>(i))
         {
@@ -929,9 +966,41 @@ struct BasicPass : public FunctionPass {
 
           //print out values
           //std::copy(std::begin(indices), std::end(indices), std::ostream_iterator<int>(llvm::outs, ":"));
-          for(auto& index : indices)
+          format_string << "GEP-";
+          for(const auto& index : indices)
           {
-            data_string << std::hex << index << ":";
+            format_string << std::hex << index << "-";
+          }
+
+          if(composite_type != nullptr)
+          {
+            DIType *di_type = nullptr;
+            auto elements = composite_type->getElements();
+
+            //skip first index
+            for(int i = 1; i < indices.size(); i++)
+            {
+              const auto& index = indices[i];
+              if(index > elements.size())
+              {
+                //well, shouldn't happen
+                EXIT_WITH_MESSAGE("Indices is greater than element size")
+              }
+              auto di_node = elements[index];
+              if(di_type = dyn_cast<DIType>(di_node))
+              {
+                if(DIDerivedType* derived_type = dyn_cast<DIDerivedType>(di_type))
+                {
+                  if(derived_type->getTag() == dwarf::DW_TAG_member)
+                  {
+                    format_string << "GEPDONE-" << derived_type->getName().data() << "-";
+                  }
+                  //need to iterate even more for bigger underlying structs...
+
+                  di_type = derived_type->getBaseType().resolve();
+                }
+              }
+            }
           }
         }
         else if(StoreInst* store_inst = dyn_cast<StoreInst>(i))
@@ -939,13 +1008,13 @@ struct BasicPass : public FunctionPass {
           //this must be the last instruction!!!
           if(ConstantInt* constant_int = dyn_cast<ConstantInt>(store_inst->getValueOperand()))
           {
-            data_string << "s-" << constant_int->getZExtValue();
+            format_string << "s-" << constant_int->getZExtValue();
           } 
           else
           {
             //form pointer value
-            data_string << "s-";
-            format_string += "%p";
+            format_string << "s-";
+            format_string << "%p";
             //std::vector<Value*> indices{ ConstantInt::get(basic_block->getContext(), APInt(32, 0))};
 
             Value* store_operand = store_inst->getValueOperand();
@@ -959,7 +1028,7 @@ struct BasicPass : public FunctionPass {
           //check if malloc/free
           if(called_function == "malloc")
           {
-            data_string << "m:";
+            format_string << "m-";
           }
           else if(called_function == "free")
           {
@@ -967,8 +1036,8 @@ struct BasicPass : public FunctionPass {
             if(call_inst->getNumArgOperands() == 1)
             {
               //form pointer value like store
-              data_string << "f-";
-              format_string += "%p";
+              format_string << "f-";
+              format_string << "%p";
 
               //argument of free
               stored_pointer_value = call_inst->getArgOperand(0);
@@ -991,18 +1060,16 @@ struct BasicPass : public FunctionPass {
       }
 
       //end format string
-      format_string += "\n";
+      format_string << "\n";
 
       //create format string value
-      Value* format_string_value = ir_builder.CreateGlobalStringPtr(format_string);
-
-      //create data string value
-      Value* data_string_value = ir_builder.CreateGlobalStringPtr(data_string.str());
+      Value* format_string_value = ir_builder.CreateGlobalStringPtr(format_string.str());
 
       //put as argument
       arguments.emplace_back(format_string_value);
-      arguments.emplace_back(data_string_value);
 
+      arguments.insert(std::end(arguments), std::begin(load_variables), std::end(load_variables));
+      
       if (stored_pointer_value) 
       {
         arguments.emplace_back(stored_pointer_value);
