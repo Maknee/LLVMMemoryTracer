@@ -5,6 +5,7 @@ typedef struct
 {
 	int one;
 	char two;
+	int three;
 } Stuff;
 
 //read from stuff
@@ -29,12 +30,12 @@ int main()
 	(*addr_s2)->one = 1;
 	(*addr_s2)->two = 'b';
 
-	//free
-	free(s2);
-
 	//memcpy operation
 	Stuff s3 = { 0 };
 	memcpy(s2, &s3, sizeof(Stuff));
+	
+	//free
+	free(s2);
 
 	return 0;
 }
